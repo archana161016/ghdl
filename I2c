@@ -1,0 +1,182 @@
+ library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity i2c_master is
+    Port (
+        clk         : in  std_logic;  -- System clock
+        reset       : in  std_logic;  -- Reset signal
+        start       : in  std_logic;  -- Start signal for I2C transaction
+        rw          : in  std_logic;  -- Read/Write control (0: Write, 1: Read)
+        device_addr : in  std_logic_vector(6 downto 0); -- 7-bit slave address
+        reg_addr    : in  std_logic_vector(7 downto 0); -- Register address
+        data_in     : in  std_logic_vector(7 downto 0); -- Data to write
+        data_out    : out std_logic_vector(7 downto 0); -- Data read
+        sda         : inout std_logic; -- Serial Data Line
+        scl         : out std_logic  -- Serial Clock Line
+    );
+end i2c_master;
+
+architecture Behavioral of i2c_master is
+
+    type state_type is (IDLE, I2C_START, DEVICE_ADDR, ACK1, WRITE_REG, ACK2, WRITE_DATA, ACK3, I2C_RESTART, READ_ADDR, ACK4, READ_DATA, ACK5, I2C_STOP);
+    signal state         : state_type := IDLE;
+    signal scl_internal  : std_logic := '1';
+    signal sda_internal  : std_logic := '1';
+    signal bit_index     : integer range 0 to 7 := 0; -- Index for sending bits
+    signal temp_data_out : std_logic_vector(7 downto 0); -- Temp buffer for reading
+    signal device_rw     : std_logic_vector(7 downto 0); -- 7-bit address + R/W bit
+
+begin
+
+    scl <= scl_internal; -- Assign internal SCL to the output SCL
+    sda <= sda_internal when state /= READ_DATA else 'Z'; -- Tri-state SDA during READ
+
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            state <= IDLE;
+            scl_internal <= '1';
+            sda_internal <= '1';
+            data_out <= (others => '0');
+            bit_index <= 0;
+            device_rw <= (others => '0');
+            temp_data_out <= (others => '0');
+
+        elsif rising_edge(clk) then
+            case state is
+                -- IDLE State: Wait for start signal
+                when IDLE =>
+                    if start = '1' then
+                        state <= I2C_START;
+                    end if;
+
+                -- I2C_START State: Generate start condition
+                when I2C_START =>
+                    sda_internal <= '0'; -- Pull SDA low
+                    scl_internal <= '1';
+                    device_rw <= device_addr & rw; -- Combine device address with R/W bit
+                    state <= DEVICE_ADDR;
+
+                -- DEVICE_ADDR State: Send the device address bit by bit
+                when DEVICE_ADDR =>
+                    if bit_index < 8 then
+                        sda_internal <= device_rw(7 - bit_index); -- Send bits MSB first
+                        bit_index <= bit_index + 1;
+                    else
+                        bit_index <= 0; -- Reset bit index
+                        state <= ACK1; -- Wait for ACK
+                    end if;
+
+                -- ACK1 State: Wait for ACK after device address
+                when ACK1 =>
+                    scl_internal <= '0'; -- Pull SCL low before checking ACK
+                    if sda = '0' then -- Check if ACK is received (SDA low)
+                        scl_internal <= '1'; -- Acknowledge clock pulse
+                        if rw = '0' then
+                            state <= WRITE_REG; -- Proceed to write register address
+                        else
+                            state <= READ_ADDR; -- Proceed to read operation
+                        end if;
+                    else
+                        state <= I2C_STOP; -- No ACK, stop transaction
+                    end if;
+
+                -- WRITE_REG State: Send the register address bit by bit
+                when WRITE_REG =>
+                    if bit_index < 8 then
+                        sda_internal <= reg_addr(7 - bit_index); -- Send register address
+                        bit_index <= bit_index + 1;
+                    else
+                        bit_index <= 0; -- Reset bit index
+                        state <= ACK2; -- Wait for ACK
+                    end if;
+
+                -- ACK2 State: Wait for ACK after register address
+                when ACK2 =>
+                    scl_internal <= '0'; -- Pull SCL low before checking ACK
+                    if sda = '0' then -- Check if ACK is received
+                        scl_internal <= '1'; -- Acknowledge clock pulse
+                        state <= WRITE_DATA; -- Proceed to write data
+                    else
+                        state <= I2C_STOP; -- No ACK, stop transaction
+                    end if;
+
+                -- WRITE_DATA State: Send the data bit by bit
+                when WRITE_DATA =>
+                    if bit_index < 8 then
+                        sda_internal <= data_in(7 - bit_index); -- Send data
+                        bit_index <= bit_index + 1;
+                    else
+                        bit_index <= 0; -- Reset bit index
+                        state <= ACK3; -- Wait for ACK
+                    end if;
+
+                -- ACK3 State: Wait for ACK after data
+                when ACK3 =>
+                    scl_internal <= '0'; -- Pull SCL low before checking ACK
+                    if sda = '0' then -- Check if ACK is received
+                        scl_internal <= '1'; -- Acknowledge clock pulse
+                        state <= I2C_STOP; -- Stop the transaction
+                    else
+                        state <= I2C_STOP; -- No ACK, stop transaction
+                    end if;
+
+                -- I2C_RESTART State: Generate repeated start condition
+                when I2C_RESTART =>
+                    sda_internal <= '0'; -- Pull SDA low for restart
+                    scl_internal <= '1';
+                    state <= READ_ADDR;
+
+                -- READ_ADDR State: Send the device address for read
+                when READ_ADDR =>
+                    if bit_index < 8 then
+                        sda_internal <= device_rw(7 - bit_index); -- Send address with R/W bit = 1
+                        bit_index <= bit_index + 1;
+                    else
+                        bit_index <= 0; -- Reset bit index
+                        state <= ACK4; -- Wait for ACK
+                    end if;
+
+                -- ACK4 State: Wait for ACK after read address
+                when ACK4 =>
+                    scl_internal <= '0'; -- Pull SCL low before checking ACK
+                    if sda = '0' then -- Check if ACK is received
+                        scl_internal <= '1'; -- Acknowledge clock pulse
+                        state <= READ_DATA; -- Proceed to read data
+                    else
+                        state <= I2C_STOP; -- No ACK, stop transaction
+                    end if;
+
+                -- READ_DATA State: Read the data bit by bit
+                when READ_DATA =>
+                    if bit_index < 8 then
+                        temp_data_out(7 - bit_index) <= sda; -- Read data bits
+                        bit_index <= bit_index + 1;
+                    else
+                        data_out <= temp_data_out; -- Store the read data
+                        bit_index <= 0; -- Reset bit index
+                        state <= ACK5; -- Wait for ACK
+                    end if;
+
+                -- ACK5 State: Generate ACK after reading data
+                when ACK5 =>
+                    scl_internal <= '0'; -- Pull SCL low
+                    sda_internal <= '0'; -- Generate ACK (master pulls SDA low)
+                    scl_internal <= '1'; -- Acknowledge clock pulse
+                    state <= I2C_STOP; -- Proceed to stop condition
+
+                -- I2C_STOP State: Generate stop condition
+                when I2C_STOP =>
+                    sda_internal <= '0'; -- Pull SDA low
+                    scl_internal <= '1';
+                    sda_internal <= '1'; -- Release SDA
+                    state <= IDLE; -- Return to idle state
+
+                when others =>
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+
+end Behavioral;
